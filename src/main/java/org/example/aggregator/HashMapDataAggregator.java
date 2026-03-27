@@ -11,23 +11,18 @@ import java.util.stream.Stream;
 public class HashMapDataAggregator implements DataAggregator {
 
 
-    private final Map<String, CampaignStats> map = new ConcurrentHashMap<>(1 << 14); // 16384, power of 2
+    private final Map<String, CampaignStats> map = new HashMap<>();
 
     @Override
     public void process(Stream<CsvRecord> records) {
-        ForkJoinPool pool = new ForkJoinPool(Runtime.getRuntime().availableProcessors());
-        try {
-            pool.submit(() ->
-                    records.parallel().forEach(r ->
-                            map.computeIfAbsent(r.campaignId(), CampaignStats::new)
-                                    .accumulate(r.impressions(), r.clicks(), r.spend(), r.conversions())
-                    )
-            ).get();
-        } catch (Exception e) {
-            throw new RuntimeException("Processing failed", e.getCause());
-        } finally {
-            pool.shutdown();
-        }
+        // each parallel thread builds its own local map, then merge — no contention
+        Map<String, CampaignStats> merged = records.parallel().collect(
+                () -> new HashMap<String, CampaignStats>(1024),
+                (localMap, r) -> localMap.computeIfAbsent(r.campaignId(), k -> new CampaignStats(r.campaignId()))
+                        .accumulate(r.impressions(), r.clicks(), r.spend(), r.conversions()),
+                (m1, m2) -> m2.forEach((k, v) -> m1.merge(k, v, CampaignStats::merge))
+        );
+        map.putAll(merged);
     }
 
     @Override
@@ -38,7 +33,7 @@ public class HashMapDataAggregator implements DataAggregator {
     @Override
     public List<CampaignStats> topByCpa(int limit) {
         List<CampaignStats> withConversions = map.values().stream()
-                .filter(c -> c.totalConversions.intValue() > 0)
+                .filter(c -> c.totalConversions > 0)
                 .toList();
         return topK(withConversions, limit, Comparator.comparingDouble(CampaignStats::cpa).reversed());
     }
